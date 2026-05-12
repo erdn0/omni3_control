@@ -20,16 +20,15 @@ import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
 
-sys.path.insert(0, '/home/robocupmsl/Downloads/RobocupRobot-20250322T204420Z-001/RobocupRobot/roboclaw_python')
-
-from roboclaw_3 import Roboclaw
+from omni3_control.roboclaw import Roboclaw, RoboClawError
 from omni3_control.kinematics import OmniKinematics, OmniParams
 
 # ── DONANIM ──────────────────────────────────────────────────────────────────
-PORT      = '/dev/ttyAMA0'
+PORT_A    = '/dev/roboclaw_front'   # RoboClaw 1 (0x80) — Wheel1 M2 / Wheel2 M1
+PORT_B    = '/dev/roboclaw_rear'    # RoboClaw 2 (0x81) — Wheel3 M2
 BAUDRATE  = 38400
-ADDR_A    = 0x80   # Wheel1 (M2) + Wheel2 (M1)
-ADDR_B    = 0x81   # Wheel3 (M2)
+ADDR_A    = 0x80
+ADDR_B    = 0x81
 
 DIR_W1    = -1
 DIR_W2    = -1
@@ -69,32 +68,47 @@ class Move1mNode(Node):
             beta=(-60.0, 60.0, 180.0),
         ))
 
-        # Roboclaw — küçük timeout, 1 deneme (bloklanmayı önler)
-        self.rc = Roboclaw(PORT, BAUDRATE, timeout=0.01, retries=1)
-        if self.rc.Open() == 0:
-            self.get_logger().fatal('Roboclaw seri port açılamadı!')
+        # İki ayrı USB port — her RoboClaw kendi bağlantısında
+        try:
+            self.rc_a = Roboclaw(PORT_A, BAUDRATE, timeout=0.1)
+            self.get_logger().info(f'RoboClaw A açıldı: {PORT_A}')
+        except Exception as e:
+            self.get_logger().fatal(f'RoboClaw A açılamadı ({PORT_A}): {e}')
             raise RuntimeError('serial error')
-        self.rc._port.timeout = 0.05   # serial okuma timeout: 50 ms
 
-        self.rc.SetM1VelocityPID(ADDR_A, PID_P, PID_I, PID_D, QPPS_MAX)
-        self.rc.SetM2VelocityPID(ADDR_A, PID_P, PID_I, PID_D, QPPS_MAX)
-        self.rc.SetM2VelocityPID(ADDR_B, PID_P, PID_I, PID_D, QPPS_MAX)
-        self.rc.ResetEncoders(ADDR_A)
-        self.rc.ResetEncoders(ADDR_B)
+        try:
+            self.rc_b = Roboclaw(PORT_B, BAUDRATE, timeout=0.1)
+            self.get_logger().info(f'RoboClaw B açıldı: {PORT_B}')
+        except Exception as e:
+            self.get_logger().fatal(f'RoboClaw B açılamadı ({PORT_B}): {e}')
+            raise RuntimeError('serial error')
+
+        self.rc_a.SetM1VelocityPID(ADDR_A, PID_P, PID_I, PID_D, QPPS_MAX)
+        self.rc_a.SetM2VelocityPID(ADDR_A, PID_P, PID_I, PID_D, QPPS_MAX)
+        self.rc_b.SetM2VelocityPID(ADDR_B, PID_P, PID_I, PID_D, QPPS_MAX)
+        self.rc_a.ResetEncoders(ADDR_A)
+        self.rc_b.ResetEncoders(ADDR_B)
         time.sleep(0.1)
 
-        # Paylaşılan encoder verisi (thread-safe)
-        self._enc_lock = threading.Lock()
-        self._enc_counts = [0, 0, 0]   # [w1, w2, w3] anlık sayaç
+        # Paylaşılan encoder verisi (thread-safe) — signed int32
+        self._enc_lock   = threading.Lock()
+        self._enc_counts = [0, 0, 0]
+        self._enc_ready  = False   # ilk okuma tamamlanana kadar kontrol bekler
 
         # Encoder okuma thread'i başlat
-        self._running = True
+        self._running  = True
         self._enc_thread = threading.Thread(target=self._enc_reader, daemon=True)
         self._enc_thread.start()
 
+        # İlk encoder değerini bekle (prev ile aynı başlasın, sıçrama olmasın)
+        while not self._enc_ready:
+            time.sleep(0.01)
+        with self._enc_lock:
+            self._prev_enc = list(self._enc_counts)
+
         # Durum
-        self.pose     = np.zeros(3)   # [x, y, θ]
-        self._prev_enc = [0, 0, 0]
+        self.pose = np.zeros(3)
+        self.done = False
         self.done     = False
 
         # Odometry yayınla (isteğe bağlı — rviz için)
@@ -107,15 +121,22 @@ class Move1mNode(Node):
         self.get_logger().info(f'Hedef: ({GOAL_X}, {GOAL_Y}) m  |  Tolerans: {GOAL_TOL*100:.0f} cm')
 
     # ── Encoder okuma thread'i ────────────────────────────────────────────────
+    @staticmethod
+    def _to_signed(v: int) -> int:
+        return v if v < 2147483648 else v - 4294967296
+
     def _enc_reader(self):
-        """Ayrı thread: encoder'ları sürekli okur, kontrol döngüsünü bloklamaz."""
+        """Ayrı thread: encoder'ları sürekli okur, signed int32 olarak saklar."""
         while self._running:
             try:
-                w1 = self.rc.ReadEncM2(ADDR_A)[1]
-                w2 = self.rc.ReadEncM1(ADDR_A)[1]
-                w3 = self.rc.ReadEncM2(ADDR_B)[1]
+                w1, _ = self.rc_a.ReadEncM2(ADDR_A)
+                w2, _ = self.rc_a.ReadEncM1(ADDR_A)
+                w3, _ = self.rc_b.ReadEncM2(ADDR_B)
                 with self._enc_lock:
-                    self._enc_counts = [w1, w2, w3]
+                    self._enc_counts = [self._to_signed(w1),
+                                        self._to_signed(w2),
+                                        self._to_signed(w3)]
+                    self._enc_ready = True
             except Exception as e:
                 self.get_logger().warn(f'Encoder okuma hatası: {e}', throttle_duration_sec=2.0)
             time.sleep(0.02)   # ~50 Hz
@@ -187,9 +208,9 @@ class Move1mNode(Node):
         q2 = int(round(phi_dot[1] * DIR_W2 * RAD2QPPS))
         q3 = int(round(phi_dot[2] * DIR_W3 * RAD2QPPS))
 
-        self.rc.SpeedM2(ADDR_A, q1)
-        self.rc.SpeedM1(ADDR_A, q2)
-        self.rc.SpeedM2(ADDR_B, q3)
+        self.rc_a.SpeedM2(ADDR_A, q1)
+        self.rc_a.SpeedM1(ADDR_A, q2)
+        self.rc_b.SpeedM2(ADDR_B, q3)
 
     # ── Yardımcılar ───────────────────────────────────────────────────────────
     def _publish_odom(self):
@@ -205,13 +226,15 @@ class Move1mNode(Node):
         self.odom_pub.publish(odom)
 
     def _stop(self):
-        self.rc.SpeedM2(ADDR_A, 0)
-        self.rc.SpeedM1(ADDR_A, 0)
-        self.rc.SpeedM2(ADDR_B, 0)
+        self.rc_a.SpeedM2(ADDR_A, 0)
+        self.rc_a.SpeedM1(ADDR_A, 0)
+        self.rc_b.SpeedM2(ADDR_B, 0)
 
     def destroy_node(self):
         self._running = False
         self._stop()
+        self.rc_a.close()
+        self.rc_b.close()
         super().destroy_node()
 
 
