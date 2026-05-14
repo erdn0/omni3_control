@@ -53,6 +53,13 @@ PHI_REF  = 0.0    # [rad]
 T_TOTAL  = 5.0    # [s]   trayektori suresi
 DT       = 0.05   # [s]   kontrol periyodu
 
+# ── SANAL ENGEL (daire) ──────────────────────────────────────────────────────
+OBS_X      = 0.5    # [m]   engel merkez x
+OBS_Y      = 0.0    # [m]   engel merkez y
+OBS_R      = 0.10   # [m]   engel yari capi
+OBS_MARGIN = 0.10   # [m]   guvenlik tamponu (r_safe = OBS_R + OBS_MARGIN)
+OBS_ENABLE = True   # False → engel yok say, dogrudan hedefe git
+
 
 class GoStopNode(Node):
 
@@ -107,9 +114,41 @@ class GoStopNode(Node):
         self.pose = np.zeros(3)
         self.done = False
 
-        # Quintic trayektoriler — baslangic (0,0,0)
-        self.tx   = QuinticTrajectory(0.0, X_REF,   T_TOTAL)
-        self.ty   = QuinticTrajectory(0.0, Y_REF,   T_TOTAL)
+        # Quintic plan: tek segment (dogrudan) veya iki segment (engel etrafindan)
+        S = np.array([0.0, 0.0])
+        G = np.array([X_REF, Y_REF])
+        V = None
+        if OBS_ENABLE:
+            C      = np.array([OBS_X, OBS_Y])
+            r_safe = OBS_R + OBS_MARGIN
+            V = self._plan_via_point(S, G, C, r_safe)
+
+        if V is None:
+            # Carpisma yok → tek quintic
+            self._segments = [(
+                QuinticTrajectory(0.0, X_REF, T_TOTAL),
+                QuinticTrajectory(0.0, Y_REF, T_TOTAL),
+                0.0, T_TOTAL,
+            )]
+            plan_info = 'tek segment (engel yok / hizada degil)'
+        else:
+            # Iki segment, zamani uzunluk oranina gore bol
+            d1 = float(np.linalg.norm(V - S))
+            d2 = float(np.linalg.norm(G - V))
+            T1 = T_TOTAL * d1 / (d1 + d2)
+            T2 = T_TOTAL - T1
+            self._segments = [
+                (QuinticTrajectory(0.0,    V[0],  T1),
+                 QuinticTrajectory(0.0,    V[1],  T1),
+                 0.0, T1),
+                (QuinticTrajectory(V[0],   X_REF, T2),
+                 QuinticTrajectory(V[1],   Y_REF, T2),
+                 T1, T_TOTAL),
+            ]
+            plan_info = (f'iki segment | via=({V[0]:+.3f}, {V[1]:+.3f})  '
+                         f'd1={d1:.3f} d2={d2:.3f}  T1={T1:.2f} T2={T2:.2f}')
+
+        # phi her zaman tek quintic — yon segmentlerden bagimsiz
         self.tphi = QuinticTrajectory(0.0, PHI_REF, T_TOTAL)
         self._t0  = time.monotonic()
 
@@ -123,6 +162,38 @@ class GoStopNode(Node):
         self.get_logger().info(
             f'Hedef: x={X_REF} m, y={Y_REF} m, phi={PHI_REF} rad  |  T={T_TOTAL} s'
         )
+        if OBS_ENABLE:
+            self.get_logger().info(
+                f'Engel: ({OBS_X}, {OBS_Y}) r={OBS_R}  margin={OBS_MARGIN}  → {plan_info}'
+            )
+
+    # ── Engel etrafi yol planlama ────────────────────────────────────────────
+    @staticmethod
+    def _plan_via_point(S: np.ndarray, G: np.ndarray, C: np.ndarray, r_safe: float):
+        """
+        Daire engel (C, r_safe) S-G dogru parcasini kesiyorsa, dairenin
+        iki tarafinda da bir via-point adayi hesaplar ve toplam mesafeyi
+        kisaltani dondurur. Carpisma yoksa None.
+        """
+        SG = G - S
+        L = float(np.linalg.norm(SG))
+        if L < 1e-9:
+            return None
+        t_proj = float(np.dot(C - S, SG) / (L * L))
+        # Engel SG segmentinin "yaninda" mi? (uclar disindaysa detour gereksiz)
+        if t_proj <= 0.0 or t_proj >= 1.0:
+            return None
+        P = S + t_proj * SG
+        d = float(np.linalg.norm(C - P))
+        if d >= r_safe:
+            return None   # Yol zaten engele temas etmiyor
+        SG_hat = SG / L
+        n_perp = np.array([-SG_hat[1], SG_hat[0]])   # 90° CCW
+        V_a = C + r_safe * n_perp
+        V_b = C - r_safe * n_perp
+        len_a = float(np.linalg.norm(V_a - S) + np.linalg.norm(G - V_a))
+        len_b = float(np.linalg.norm(V_b - S) + np.linalg.norm(G - V_b))
+        return V_a if len_a <= len_b else V_b
 
     # ── Encoder thread ───────────────────────────────────────────────────────
     @staticmethod
@@ -181,10 +252,17 @@ class GoStopNode(Node):
         ])
         self._publish_odom()
 
-        # Quintic referansi
+        # Quintic referansi — aktif segmenti bul
         t = time.monotonic() - self._t0
-        x_r, y_r, phi_r       = self.tx.s(t),     self.ty.s(t),     self.tphi.s(t)
-        vx_r, vy_r, w_r       = self.tx.s_dot(t), self.ty.s_dot(t), self.tphi.s_dot(t)
+        tx_seg, ty_seg, t_start = self._segments[-1][0], self._segments[-1][1], self._segments[-1][2]
+        for tx_s, ty_s, ts, te in self._segments:
+            if t < te:
+                tx_seg, ty_seg, t_start = tx_s, ty_s, ts
+                break
+        seg_t = t - t_start
+        x_r, y_r       = tx_seg.s(seg_t),     ty_seg.s(seg_t)
+        vx_r, vy_r     = tx_seg.s_dot(seg_t), ty_seg.s_dot(seg_t)
+        phi_r, w_r     = self.tphi.s(t),      self.tphi.s_dot(t)
 
         self.get_logger().info(
             f'── t={t:5.2f}/{T_TOTAL:.2f} s\n'
