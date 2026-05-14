@@ -21,6 +21,7 @@ setup(
         'console_scripts': [
             'kinematics_node = omni3_control.kinematics_node:main',
             'move_1m_node    = omni3_control.move_1m_node:main',
+            'go_stop_node    = omni3_control.go_stop_node:main',
         ],
     },
 )

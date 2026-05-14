@@ -8,7 +8,7 @@ RoboClaw USB encoder okuma — her port ayri thread ile paralel okunur.
 import time
 import sys
 import threading
-from roboclaw import Roboclaw, RoboClawError
+from omni3_control.roboclaw import Roboclaw, RoboClawError
 
 PORT_1 = "/dev/ttyACM0"
 PORT_2 = "/dev/ttyACM1"
@@ -16,10 +16,6 @@ BAUD   = 38400
 ADDR_1 = 0x80
 ADDR_2 = 0x81
 RATE   = 50   # Hz
-
-
-def to_signed(val: int) -> int:
-    return val if val < 2147483648 else val - 4294967296
 
 
 class EncoderReader(threading.Thread):
@@ -37,10 +33,7 @@ class EncoderReader(threading.Thread):
             for m in self.motors:
                 try:
                     fn = self._rc.ReadEncM1 if m == 1 else self._rc.ReadEncM2
-                    val, ok = fn(self.address)
-                    self.values[m] = to_signed(val) if ok else None
-                    if not ok:
-                        self.errors[m] += 1
+                    self.values[m] = fn(self.address)
                 except Exception:
                     self.values[m] = None
                     self.errors[m] += 1

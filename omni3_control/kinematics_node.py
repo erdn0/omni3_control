@@ -23,8 +23,10 @@ from std_msgs.msg import Float64MultiArray, Int32MultiArray
 from nav_msgs.msg import Odometry
 
 from omni3_control.kinematics import OmniKinematics, OmniParams
-
-COUNTS_PER_REV = 750
+from omni3_control.constants import (
+    COUNTS_PER_REV, CPR2RAD, RAD2QPPS,
+    WHEEL_RADIUS, ROBOT_RADIUS, WHEEL_BETAS,
+)
 
 
 class KinematicsNode(Node):
@@ -32,16 +34,16 @@ class KinematicsNode(Node):
     def __init__(self):
         super().__init__('kinematics_node')
 
-        self.declare_parameter('wheel_radius', 0.05)
-        self.declare_parameter('robot_radius', 0.27)
+        self.declare_parameter('wheel_radius', WHEEL_RADIUS)
+        self.declare_parameter('robot_radius', ROBOT_RADIUS)
 
         r = self.get_parameter('wheel_radius').value
         L = self.get_parameter('robot_radius').value
 
         self.kin      = OmniKinematics(OmniParams(wheel_radius=r, robot_radius=L,
-                                                   beta=(-60.0, 60.0, 180.0)))
-        self.rad2qpps = COUNTS_PER_REV / (2.0 * math.pi)
-        self.cpr2rad  = 2.0 * math.pi / COUNTS_PER_REV
+                                                   beta=WHEEL_BETAS))
+        self.rad2qpps = RAD2QPPS
+        self.cpr2rad  = CPR2RAD
         self.pose     = np.zeros(3)   # [x, y, θ]
 
         self.wheel_pub = self.create_publisher(Float64MultiArray, '/wheel_speeds_qpps', 10)
@@ -68,6 +70,10 @@ class KinematicsNode(Node):
     # ── /encoder_delta → pose + /odom ────────────────────────────────────────
     def _encoder_cb(self, msg: Int32MultiArray):
         if len(msg.data) < 3:
+            self.get_logger().warn(
+                f'/encoder_delta mesaji 3 eleman bekleniyor, {len(msg.data)} geldi',
+                throttle_duration_sec=2.0,
+            )
             return
 
         dphi = np.array([msg.data[i] * self.cpr2rad for i in range(3)])

@@ -70,14 +70,18 @@ class Roboclaw:
 
     # ── encoder ───────────────────────────────────────────────────────────────
 
-    def ReadEncM1(self, address: int) -> tuple[int, bool]:
-        """(deger, gecerli_mi) döner. Status bit1=yon, bit2=overflow."""
-        result = self._read_cmd(address, 0x10, ">IB")
-        return result[0], True
+    @staticmethod
+    def _to_signed32(v: int) -> int:
+        return v - 0x100000000 if v & 0x80000000 else v
 
-    def ReadEncM2(self, address: int) -> tuple[int, bool]:
-        result = self._read_cmd(address, 0x11, ">IB")
-        return result[0], True
+    def ReadEncM1(self, address: int) -> int:
+        """Signed int32 encoder sayaci. CRC hatasinda RoboClawError firlatir."""
+        raw, _status = self._read_cmd(address, 0x10, ">IB")
+        return self._to_signed32(raw)
+
+    def ReadEncM2(self, address: int) -> int:
+        raw, _status = self._read_cmd(address, 0x11, ">IB")
+        return self._to_signed32(raw)
 
     # ── hız ──────────────────────────────────────────────────────────────────
 

@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-move_1m_node.py — self-contained
-Encoder okuma ayrı thread'de yapılır (kontrol döngüsünü bloklamaz).
-Kinematics hesabı doğrudan bu node içinde yapılır.
+go_stop_node.py — GO-STOP quintic trayektori takibi (feedforward only).
 
-Wheel haritası:
-  Wheel1  β=−60°  0x80 M2  (sağ ön)
-  Wheel2  β=+60°  0x80 M1  (sol ön)
-  Wheel3  β=180°  0x81 M2  (arka)
+Baslangic (0, 0, 0) noktasindan (X_REF, Y_REF, PHI_REF) hedefine
+T_TOTAL saniyede rest-to-rest quintic polinom ile gider. Her eksen
+icin bagimsiz s(t) hesaplanir; s_dot(t) dunya cercevesi hiz olarak
+inverse kinematics uzerinden tekerleklere feedforward edilir.
+
+Wheel haritasi (move_1m_node ile ayni):
+  Wheel1  beta=-60   0x80 M2  (sag on)
+  Wheel2  beta=+60   0x80 M1  (sol on)
+  Wheel3  beta=180   0x81 M2  (arka)
 """
 
-import sys
 import math
 import time
 import threading
@@ -22,14 +24,15 @@ from nav_msgs.msg import Odometry
 
 from omni3_control.roboclaw import Roboclaw, RoboClawError
 from omni3_control.kinematics import OmniKinematics, OmniParams
+from omni3_control.quintic import QuinticTrajectory
 from omni3_control.constants import (
     WHEEL_RADIUS, ROBOT_RADIUS, WHEEL_BETAS,
     CPR2RAD, RAD2QPPS, ENC_STALE_SEC,
 )
 
 # ── DONANIM ──────────────────────────────────────────────────────────────────
-PORT_A    = '/dev/roboclaw_front'   # RoboClaw 1 (0x80) — Wheel1 M2 / Wheel2 M1
-PORT_B    = '/dev/roboclaw_rear'    # RoboClaw 2 (0x81) — Wheel3 M2
+PORT_A    = '/dev/roboclaw_front'   # RoboClaw 1 (0x80) — W1 M2 / W2 M1
+PORT_B    = '/dev/roboclaw_rear'    # RoboClaw 2 (0x81) — W3 M2
 BAUDRATE  = 38400
 ADDR_A    = 0x80
 ADDR_B    = 0x81
@@ -43,19 +46,18 @@ PID_I     = 0
 PID_D     = 0
 QPPS_MAX  = 3000
 
-# ── KONTROL ──────────────────────────────────────────────────────────────────
-GOAL_X   = 1.0
-GOAL_Y   = 0.0
-GOAL_TOL = 0.02   # [m]
-MAX_LIN  = 0.30   # [m/s]
-KP_LIN   = 3.0
-DT       = 0.05   # [s]  kontrol döngüsü periyodu
+# ── GO-STOP HEDEF ────────────────────────────────────────────────────────────
+X_REF    = 1.0    # [m]
+Y_REF    = 0.0    # [m]
+PHI_REF  = 0.0    # [rad]
+T_TOTAL  = 5.0    # [s]   trayektori suresi
+DT       = 0.05   # [s]   kontrol periyodu
 
 
-class Move1mNode(Node):
+class GoStopNode(Node):
 
     def __init__(self):
-        super().__init__('move_1m_node')
+        super().__init__('go_stop_node')
 
         # Kinematics
         self.kin = OmniKinematics(OmniParams(
@@ -64,19 +66,19 @@ class Move1mNode(Node):
             beta=WHEEL_BETAS,
         ))
 
-        # İki ayrı USB port — her RoboClaw kendi bağlantısında
+        # Iki RoboClaw
         try:
             self.rc_a = Roboclaw(PORT_A, BAUDRATE, timeout=0.1)
-            self.get_logger().info(f'RoboClaw A açıldı: {PORT_A}')
+            self.get_logger().info(f'RoboClaw A acildi: {PORT_A}')
         except Exception as e:
-            self.get_logger().fatal(f'RoboClaw A açılamadı ({PORT_A}): {e}')
+            self.get_logger().fatal(f'RoboClaw A acilamadi ({PORT_A}): {e}')
             raise RuntimeError('serial error')
 
         try:
             self.rc_b = Roboclaw(PORT_B, BAUDRATE, timeout=0.1)
-            self.get_logger().info(f'RoboClaw B açıldı: {PORT_B}')
+            self.get_logger().info(f'RoboClaw B acildi: {PORT_B}')
         except Exception as e:
-            self.get_logger().fatal(f'RoboClaw B açılamadı ({PORT_B}): {e}')
+            self.get_logger().fatal(f'RoboClaw B acilamadi ({PORT_B}): {e}')
             raise RuntimeError('serial error')
 
         self.rc_a.SetM1VelocityPID(ADDR_A, PID_P, PID_I, PID_D, QPPS_MAX)
@@ -86,18 +88,16 @@ class Move1mNode(Node):
         self.rc_b.ResetEncoders(ADDR_B)
         time.sleep(0.1)
 
-        # Paylaşılan encoder verisi (thread-safe) — signed int32
-        self._enc_lock     = threading.Lock()
-        self._enc_counts   = [0, 0, 0]
-        self._enc_last_ts  = 0.0   # son basarili okuma (monotonic)
-        self._enc_ready    = False
+        # Paylasilan encoder verisi
+        self._enc_lock    = threading.Lock()
+        self._enc_counts  = [0, 0, 0]
+        self._enc_last_ts = 0.0
+        self._enc_ready   = False
 
-        # Encoder okuma thread'i başlat
-        self._running  = True
+        self._running    = True
         self._enc_thread = threading.Thread(target=self._enc_reader, daemon=True)
         self._enc_thread.start()
 
-        # İlk encoder değerini bekle (prev ile aynı başlasın, sıçrama olmasın)
         while not self._enc_ready:
             time.sleep(0.01)
         with self._enc_lock:
@@ -107,23 +107,29 @@ class Move1mNode(Node):
         self.pose = np.zeros(3)
         self.done = False
 
-        # Odometry yayınla (isteğe bağlı — rviz için)
+        # Quintic trayektoriler — baslangic (0,0,0)
+        self.tx   = QuinticTrajectory(0.0, X_REF,   T_TOTAL)
+        self.ty   = QuinticTrajectory(0.0, Y_REF,   T_TOTAL)
+        self.tphi = QuinticTrajectory(0.0, PHI_REF, T_TOTAL)
+        self._t0  = time.monotonic()
+
+        # /odom
         self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
 
-        # 20 Hz kontrol döngüsü
+        # 20 Hz kontrol
         self.create_timer(DT, self._control_loop)
 
-        self.get_logger().info('Move1mNode başladı.')
-        self.get_logger().info(f'Hedef: ({GOAL_X}, {GOAL_Y}) m  |  Tolerans: {GOAL_TOL*100:.0f} cm')
+        self.get_logger().info('GoStopNode basladi.')
+        self.get_logger().info(
+            f'Hedef: x={X_REF} m, y={Y_REF} m, phi={PHI_REF} rad  |  T={T_TOTAL} s'
+        )
 
-    # ── Encoder okuma thread'i ────────────────────────────────────────────────
+    # ── Encoder thread ───────────────────────────────────────────────────────
     @staticmethod
     def _delta_i32(cur: int, prev: int) -> int:
-        """Int32 rollover'a karsi guvenli delta."""
         return ((cur - prev + 0x80000000) & 0xFFFFFFFF) - 0x80000000
 
     def _enc_reader(self):
-        """Ayri thread: encoder'lari surekli okur (signed int32)."""
         while self._running:
             try:
                 w1 = self.rc_a.ReadEncM2(ADDR_A)
@@ -136,19 +142,18 @@ class Move1mNode(Node):
                     self._enc_ready   = True
             except Exception as e:
                 self.get_logger().warn(f'Encoder okuma hatasi: {e}', throttle_duration_sec=2.0)
-            time.sleep(0.02)   # ~50 Hz
+            time.sleep(0.02)
 
-    # ── 20 Hz kontrol döngüsü ────────────────────────────────────────────────
+    # ── 20 Hz kontrol ────────────────────────────────────────────────────────
     def _control_loop(self):
         if self.done:
             return
 
-        # Encoder anlık snapshot al
         with self._enc_lock:
             cur     = list(self._enc_counts)
             last_ts = self._enc_last_ts
 
-        # Watchdog: encoder verisi bayatladiysa motorlari durdur
+        # Watchdog
         if time.monotonic() - last_ts > ENC_STALE_SEC:
             self.get_logger().error(
                 f'Encoder verisi bayat ({time.monotonic() - last_ts:.2f}s) — motorlar durduruluyor',
@@ -157,7 +162,7 @@ class Move1mNode(Node):
             self._stop()
             return
 
-        # Tick farkı → teker açı artışı [rad] (int32 rollover guvenli)
+        # Odometri guncelle (sadece izleme/log icin — FF kontrolu degil)
         dc = [self._delta_i32(cur[i], self._prev_enc[i]) for i in range(3)]
         self._prev_enc = cur
 
@@ -166,8 +171,6 @@ class Move1mNode(Node):
             dc[1] * DIR_W2 * CPR2RAD,
             dc[2] * DIR_W3 * CPR2RAD,
         ])
-
-        # Odometri güncelle
         theta     = self.pose[2]
         disp_body = self.kin.J_inv @ (dphi * self.kin.p.wheel_radius)
         c, s      = math.cos(theta), math.sin(theta)
@@ -176,41 +179,31 @@ class Move1mNode(Node):
             s * disp_body[0] + c * disp_body[1],
             disp_body[2],
         ])
-
-        # Anlık dünya hızı (disp / DT)
-        vx_w = (c * disp_body[0] - s * disp_body[1]) / DT
-        vy_w = (s * disp_body[0] + c * disp_body[1]) / DT
-        wz_w = disp_body[2] / DT
-
-        # /odom yayınla
         self._publish_odom()
 
-        # Pozisyon hatası
-        err  = np.array([GOAL_X - self.pose[0], GOAL_Y - self.pose[1]])
-        dist = float(np.linalg.norm(err))
+        # Quintic referansi
+        t = time.monotonic() - self._t0
+        x_r, y_r, phi_r       = self.tx.s(t),     self.ty.s(t),     self.tphi.s(t)
+        vx_r, vy_r, w_r       = self.tx.s_dot(t), self.ty.s_dot(t), self.tphi.s_dot(t)
 
         self.get_logger().info(
-            f'── ENC ticks  W1={dc[0]:+5d}  W2={dc[1]:+5d}  W3={dc[2]:+5d}  '
-            f'(ham: {cur[0]:6d} {cur[1]:6d} {cur[2]:6d})\n'
-            f'   HIZLAR     vx={vx_w:+.3f} m/s  vy={vy_w:+.3f} m/s  ω={wz_w:+.3f} rad/s\n'
-            f'   KONUM      x={self.pose[0]:+.3f} m  y={self.pose[1]:+.3f} m  '
-            f'θ={math.degrees(self.pose[2]):+.1f}°  hata={dist:.3f} m'
+            f'── t={t:5.2f}/{T_TOTAL:.2f} s\n'
+            f'   PLAN   x={x_r:+.3f}  y={y_r:+.3f}  phi={math.degrees(phi_r):+.1f}°  '
+            f'vx={vx_r:+.3f}  vy={vy_r:+.3f}  w={w_r:+.3f}\n'
+            f'   GERCEK x={self.pose[0]:+.3f}  y={self.pose[1]:+.3f}  '
+            f'phi={math.degrees(self.pose[2]):+.1f}°'
         )
 
-        if dist < GOAL_TOL:
-            self.get_logger().info('Hedefe ulaşıldı!')
+        # Trayektori bitti mi?
+        if t >= T_TOTAL:
+            self.get_logger().info('Trayektori tamamlandi.')
             self._stop()
             self.done = True
             return
 
-        # P-kontrolcü → dünya hız komutu
-        v_mag   = min(KP_LIN * dist, MAX_LIN)
-        v_world = np.array([err[0] / dist * v_mag,
-                            err[1] / dist * v_mag,
-                            0.0])
-
-        # FK: dünya hızı → teker açısal hızları [rad/s] → QPPS
-        phi_dot = self.kin.forward_world(v_world, self.pose[2])
+        # FF: dunya hizi → teker hizi → QPPS
+        # theta olarak planlanan phi(t) kullanilir (FF varsayimi: takip mukemmel)
+        phi_dot = self.kin.forward_world(np.array([vx_r, vy_r, w_r]), phi_r)
         q1 = int(round(phi_dot[0] * DIR_W1 * RAD2QPPS))
         q2 = int(round(phi_dot[1] * DIR_W2 * RAD2QPPS))
         q3 = int(round(phi_dot[2] * DIR_W3 * RAD2QPPS))
@@ -219,7 +212,7 @@ class Move1mNode(Node):
         self.rc_a.SpeedM1(ADDR_A, q2)
         self.rc_b.SpeedM2(ADDR_B, q3)
 
-    # ── Yardımcılar ───────────────────────────────────────────────────────────
+    # ── Yardimcilar ──────────────────────────────────────────────────────────
     def _publish_odom(self):
         odom = Odometry()
         odom.header.stamp         = self.get_clock().now().to_msg()
@@ -247,7 +240,7 @@ class Move1mNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = Move1mNode()
+    node = GoStopNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
