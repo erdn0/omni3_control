@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-go_stop_node.py — GO-STOP quintic trayektori takibi (feedforward only).
+go_stop_fb_node.py — GO-STOP quintic trayektori takibi (feedforward + geribildirim).
+
+go_stop_node ile ayni trayektori planlamasini kullanir; fark:
+  - Her adimda konum/yon hatasi P-kontrolcusu ile duzeltilir (FF + P geribildirim).
+  - Trayektori bittikten sonra hedef konumda P-kontrol ile tutucu moda gecer.
 
 Baslangic (0, 0, 0) noktasindan (X_REF, Y_REF, PHI_REF) hedefine
-T_TOTAL saniyede rest-to-rest quintic polinom ile gider. Her eksen
-icin bagimsiz s(t) hesaplanir; s_dot(t) dunya cercevesi hiz olarak
-inverse kinematics uzerinden tekerleklere feedforward edilir.
+T_TOTAL saniyede rest-to-rest quintic polinom ile gider.
 
-Wheel haritasi (move_1m_node ile ayni):
+Wheel haritasi (move_1m_node / go_stop_node ile ayni):
   Wheel1  beta=-60   0x80 M2  (sag on)
   Wheel2  beta=+60   0x80 M1  (sol on)
   Wheel3  beta=180   0x81 M2  (arka)
@@ -31,8 +33,8 @@ from omni3_control.constants import (
 )
 
 # ── DONANIM ──────────────────────────────────────────────────────────────────
-PORT_A    = '/dev/roboclaw_front'   # RoboClaw 1 (0x80) — W1 M2 / W2 M1
-PORT_B    = '/dev/roboclaw_rear'    # RoboClaw 2 (0x81) — W3 M2
+PORT_A    = '/dev/roboclaw_front'
+PORT_B    = '/dev/roboclaw_rear'
 BAUDRATE  = 38400
 ADDR_A    = 0x80
 ADDR_B    = 0x81
@@ -54,26 +56,34 @@ T_TOTAL  = 5.0    # [s]   trayektori suresi
 DT       = 0.05   # [s]   kontrol periyodu
 
 # ── SANAL ENGEL (daire) ──────────────────────────────────────────────────────
-OBS_X      = 0.5    # [m]   engel merkez x
-OBS_Y      = 0.0    # [m]   engel merkez y
-OBS_R      = 0.10   # [m]   engel yari capi
-OBS_MARGIN = 0.10   # [m]   guvenlik tamponu (r_safe = OBS_R + OBS_MARGIN)
-OBS_ENABLE = False  # False → engel yok say, dogrudan hedefe git
+OBS_X      = 0.5
+OBS_Y      = 0.0
+OBS_R      = 0.10
+OBS_MARGIN = 0.10
+OBS_ENABLE = False
+
+# ── GERIBILDIRIM KAZANIMI ─────────────────────────────────────────────────────
+KP_XY       = 1.0   # [1/s]  trayektori sirasinda konum hatasi kazanimi (xy)
+KP_PHI      = 2.0   # [1/s]  trayektori sirasinda yon hatasi kazanimi
+KP_HOLD     = 1.5   # [1/s]  tutucu modda konum hatasi kazanimi
+KP_HOLD_PHI = 2.0   # [1/s]  tutucu modda yon hatasi kazanimi
+
+# Tutucu mod cozulmus kabul edilecek esik degerler
+HOLD_XY_TOL  = 0.005  # [m]
+HOLD_PHI_TOL = 0.01   # [rad]
 
 
-class GoStopNode(Node):
+class GoStopFbNode(Node):
 
     def __init__(self):
-        super().__init__('go_stop_node')
+        super().__init__('go_stop_fb_node')
 
-        # Kinematics
         self.kin = OmniKinematics(OmniParams(
             wheel_radius=WHEEL_RADIUS,
             robot_radius=ROBOT_RADIUS,
             beta=WHEEL_BETAS,
         ))
 
-        # Iki RoboClaw
         try:
             self.rc_a = Roboclaw(PORT_A, BAUDRATE, timeout=0.1)
             self.get_logger().info(f'RoboClaw A acildi: {PORT_A}')
@@ -95,7 +105,6 @@ class GoStopNode(Node):
         self.rc_b.ResetEncoders(ADDR_B)
         time.sleep(0.1)
 
-        # Paylasilan encoder verisi
         self._enc_lock    = threading.Lock()
         self._enc_counts  = [0, 0, 0]
         self._enc_last_ts = 0.0
@@ -110,11 +119,10 @@ class GoStopNode(Node):
         with self._enc_lock:
             self._prev_enc = list(self._enc_counts)
 
-        # Durum
-        self.pose = np.zeros(3)
-        self.done = False
+        self.pose    = np.zeros(3)
+        self._held   = False   # tutucu modda cozuldu mu
 
-        # Quintic plan: tek segment (dogrudan) veya iki segment (engel etrafindan)
+        # Quintic plan
         S = np.array([0.0, 0.0])
         G = np.array([X_REF, Y_REF])
         V = None
@@ -124,7 +132,6 @@ class GoStopNode(Node):
             V = self._plan_via_point(S, G, C, r_safe)
 
         if V is None:
-            # Carpisma yok → tek quintic
             self._segments = [(
                 QuinticTrajectory(0.0, X_REF, T_TOTAL),
                 QuinticTrajectory(0.0, Y_REF, T_TOTAL),
@@ -132,7 +139,6 @@ class GoStopNode(Node):
             )]
             plan_info = 'tek segment (engel yok / hizada degil)'
         else:
-            # Iki segment, zamani uzunluk oranina gore bol
             d1 = float(np.linalg.norm(V - S))
             d2 = float(np.linalg.norm(G - V))
             T1 = T_TOTAL * d1 / (d1 + d2)
@@ -148,19 +154,19 @@ class GoStopNode(Node):
             plan_info = (f'iki segment | via=({V[0]:+.3f}, {V[1]:+.3f})  '
                          f'd1={d1:.3f} d2={d2:.3f}  T1={T1:.2f} T2={T2:.2f}')
 
-        # phi her zaman tek quintic — yon segmentlerden bagimsiz
         self.tphi = QuinticTrajectory(0.0, PHI_REF, T_TOTAL)
         self._t0  = time.monotonic()
 
-        # /odom
         self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
-
-        # 20 Hz kontrol
         self.create_timer(DT, self._control_loop)
 
-        self.get_logger().info('GoStopNode basladi.')
+        self.get_logger().info('GoStopFbNode basladi (FF + P geribildirim).')
         self.get_logger().info(
             f'Hedef: x={X_REF} m, y={Y_REF} m, phi={PHI_REF} rad  |  T={T_TOTAL} s'
+        )
+        self.get_logger().info(
+            f'Kazanim: KP_XY={KP_XY}  KP_PHI={KP_PHI}  '
+            f'KP_HOLD={KP_HOLD}  KP_HOLD_PHI={KP_HOLD_PHI}'
         )
         if OBS_ENABLE:
             self.get_logger().info(
@@ -170,25 +176,19 @@ class GoStopNode(Node):
     # ── Engel etrafi yol planlama ────────────────────────────────────────────
     @staticmethod
     def _plan_via_point(S: np.ndarray, G: np.ndarray, C: np.ndarray, r_safe: float):
-        """
-        Daire engel (C, r_safe) S-G dogru parcasini kesiyorsa, dairenin
-        iki tarafinda da bir via-point adayi hesaplar ve toplam mesafeyi
-        kisaltani dondurur. Carpisma yoksa None.
-        """
         SG = G - S
         L = float(np.linalg.norm(SG))
         if L < 1e-9:
             return None
         t_proj = float(np.dot(C - S, SG) / (L * L))
-        # Engel SG segmentinin "yaninda" mi? (uclar disindaysa detour gereksiz)
         if t_proj <= 0.0 or t_proj >= 1.0:
             return None
         P = S + t_proj * SG
         d = float(np.linalg.norm(C - P))
         if d >= r_safe:
-            return None   # Yol zaten engele temas etmiyor
+            return None
         SG_hat = SG / L
-        n_perp = np.array([-SG_hat[1], SG_hat[0]])   # 90° CCW
+        n_perp = np.array([-SG_hat[1], SG_hat[0]])
         V_a = C + r_safe * n_perp
         V_b = C - r_safe * n_perp
         len_a = float(np.linalg.norm(V_a - S) + np.linalg.norm(G - V_a))
@@ -217,14 +217,13 @@ class GoStopNode(Node):
 
     # ── 20 Hz kontrol ────────────────────────────────────────────────────────
     def _control_loop(self):
-        if self.done:
+        if self._held:
             return
 
         with self._enc_lock:
             cur     = list(self._enc_counts)
             last_ts = self._enc_last_ts
 
-        # Watchdog
         if time.monotonic() - last_ts > ENC_STALE_SEC:
             self.get_logger().error(
                 f'Encoder verisi bayat ({time.monotonic() - last_ts:.2f}s) — motorlar durduruluyor',
@@ -233,7 +232,7 @@ class GoStopNode(Node):
             self._stop()
             return
 
-        # Odometri guncelle (sadece izleme/log icin — FF kontrolu degil)
+        # Odometri
         dc = [self._delta_i32(cur[i], self._prev_enc[i]) for i in range(3)]
         self._prev_enc = cur
 
@@ -252,45 +251,89 @@ class GoStopNode(Node):
         ])
         self._publish_odom()
 
-        # Quintic referansi — aktif segmenti bul
         t = time.monotonic() - self._t0
+
+        # ── Tutucu mod (trayektori sonrasi) ──────────────────────────────────
+        if t >= T_TOTAL:
+            ex   = X_REF   - self.pose[0]
+            ey   = Y_REF   - self.pose[1]
+            ephi = PHI_REF - self.pose[2]
+
+            dist = math.hypot(ex, ey)
+            if dist < HOLD_XY_TOL and abs(ephi) < HOLD_PHI_TOL:
+                self.get_logger().info('Hedef konuma ulasildi, motorlar durduruluyor.')
+                self._stop()
+                self._held = True
+                return
+
+            vx_cmd = KP_HOLD     * ex
+            vy_cmd = KP_HOLD     * ey
+            w_cmd  = KP_HOLD_PHI * ephi
+
+            phi_dot = self.kin.forward_world(
+                np.array([vx_cmd, vy_cmd, w_cmd]), self.pose[2]
+            )
+            self._send(phi_dot)
+
+            self.get_logger().info(
+                f'── HOLD  hata: dx={ex:+.3f}  dy={ey:+.3f}  dphi={math.degrees(ephi):+.1f}°\n'
+                f'   GERCEK x={self.pose[0]:+.3f}  y={self.pose[1]:+.3f}  '
+                f'phi={math.degrees(self.pose[2]):+.1f}°',
+                throttle_duration_sec=0.5,
+            )
+            return
+
+        # ── Trayektori modu (FF + P geribildirim) ────────────────────────────
         tx_seg, ty_seg, t_start = self._segments[-1][0], self._segments[-1][1], self._segments[-1][2]
         for tx_s, ty_s, ts, te in self._segments:
             if t < te:
                 tx_seg, ty_seg, t_start = tx_s, ty_s, ts
                 break
         seg_t = t - t_start
-        x_r, y_r       = tx_seg.s(seg_t),     ty_seg.s(seg_t)
-        vx_r, vy_r     = tx_seg.s_dot(seg_t), ty_seg.s_dot(seg_t)
-        phi_r, w_r     = self.tphi.s(t),      self.tphi.s_dot(t)
+
+        x_r, y_r   = tx_seg.s(seg_t),     ty_seg.s(seg_t)
+        vx_r, vy_r = tx_seg.s_dot(seg_t), ty_seg.s_dot(seg_t)
+        phi_r, w_r = self.tphi.s(t),      self.tphi.s_dot(t)
+
+        # Konum ve yon hatasi
+        ex   = x_r   - self.pose[0]
+        ey   = y_r   - self.pose[1]
+        ephi = phi_r - self.pose[2]
+
+        # FF + P: referans hiz + hata duzeltmesi
+        vx_cmd = vx_r + KP_XY  * ex
+        vy_cmd = vy_r + KP_XY  * ey
+        w_cmd  = w_r  + KP_PHI * ephi
+
+        # Gercek yon (pose[2]) kullanilarak world → teker hizi donusumu
+        phi_dot = self.kin.forward_world(
+            np.array([vx_cmd, vy_cmd, w_cmd]), self.pose[2]
+        )
+        self._send(phi_dot)
 
         self.get_logger().info(
             f'── t={t:5.2f}/{T_TOTAL:.2f} s\n'
             f'   PLAN   x={x_r:+.3f}  y={y_r:+.3f}  phi={math.degrees(phi_r):+.1f}°  '
             f'vx={vx_r:+.3f}  vy={vy_r:+.3f}  w={w_r:+.3f}\n'
             f'   GERCEK x={self.pose[0]:+.3f}  y={self.pose[1]:+.3f}  '
-            f'phi={math.degrees(self.pose[2]):+.1f}°'
+            f'phi={math.degrees(self.pose[2]):+.1f}°\n'
+            f'   HATA   ex={ex:+.4f}  ey={ey:+.4f}  ephi={math.degrees(ephi):+.2f}°'
         )
 
-        # Trayektori bitti mi?
-        if t >= T_TOTAL:
-            self.get_logger().info('Trayektori tamamlandi.')
-            self._stop()
-            self.done = True
-            return
-
-        # FF: dunya hizi → teker hizi → QPPS
-        # theta olarak planlanan phi(t) kullanilir (FF varsayimi: takip mukemmel)
-        phi_dot = self.kin.forward_world(np.array([vx_r, vy_r, w_r]), phi_r)
+    # ── Yardimcilar ──────────────────────────────────────────────────────────
+    def _send(self, phi_dot: np.ndarray):
         q1 = int(round(phi_dot[0] * DIR_W1 * RAD2QPPS))
         q2 = int(round(phi_dot[1] * DIR_W2 * RAD2QPPS))
         q3 = int(round(phi_dot[2] * DIR_W3 * RAD2QPPS))
-
         self.rc_a.SpeedM2(ADDR_A, q1)
         self.rc_a.SpeedM1(ADDR_A, q2)
         self.rc_b.SpeedM2(ADDR_B, q3)
 
-    # ── Yardimcilar ──────────────────────────────────────────────────────────
+    def _stop(self):
+        self.rc_a.SpeedM2(ADDR_A, 0)
+        self.rc_a.SpeedM1(ADDR_A, 0)
+        self.rc_b.SpeedM2(ADDR_B, 0)
+
     def _publish_odom(self):
         odom = Odometry()
         odom.header.stamp         = self.get_clock().now().to_msg()
@@ -303,11 +346,6 @@ class GoStopNode(Node):
         odom.pose.pose.orientation.w = float(math.cos(half))
         self.odom_pub.publish(odom)
 
-    def _stop(self):
-        self.rc_a.SpeedM2(ADDR_A, 0)
-        self.rc_a.SpeedM1(ADDR_A, 0)
-        self.rc_b.SpeedM2(ADDR_B, 0)
-
     def destroy_node(self):
         self._running = False
         self._stop()
@@ -318,7 +356,7 @@ class GoStopNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = GoStopNode()
+    node = GoStopFbNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
